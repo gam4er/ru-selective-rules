@@ -34,6 +34,16 @@ MIT в корне репозитория; полный текст сохранё
 
 Нужны Linux с systemd 249+, Python 3.11+, python3-venv, доступ HTTPS,
 `/usr/local/lib/sing-box-vpn/sing-box-stable` и `/usr/local/bin/xray`.
+Для полного Antifilter нужен сервер минимум с 2 ГиБ RAM. Служба ограничивает
+суммарную память сборщика и дочерних процессов: MemoryMax=1500M,
+MemoryHigh=1400M; Go получает GOMEMLIMIT=512MiB и GOGC=25. Это защищает другие
+службы при нехватке памяти. Эти параметры не являются измерением успешного
+пика на конкретной VM: проверьте первый полный build и повторный build с
+принятыми снимками через `systemctl show ru-selective-build -p MemoryPeak`
+и журнал службы. На более крупном сервере лимиты можно изменить через
+`sudo systemctl edit ru-selective-build.service` в секции `[Service]`.
+Python обрабатывает источники последовательно, освобождает принятые списки
+после объединения и проверяет DAT потоком без второго списка миллионов правил.
 Компилятор sing-box используется установленный; его версия попадает в manifest.
 DAT кодируется встроенным кодером protobuf GeoSiteList и обязательно проходит
 `xray run -test` с `ext:ru-selective.dat:ru-selective`.

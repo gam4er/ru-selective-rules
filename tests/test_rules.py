@@ -41,6 +41,45 @@ class RulesTests(unittest.TestCase):
         self.assertIn(b'RU-SELECTIVE',blob)  # Xray uppercases requested geosite codes.
         self.assertEqual(rules.decode_dat(blob), [('domain','a.com'),('domain_regex','^c$'),('domain_suffix','b.com')])
 
+    def test_streamed_sorted_hash_matches_existing_serialization(self):
+        rows=[('domain','a.com'),('domain_regex','^a[.]com$'),('domain_suffix','a.com')]
+        self.assertEqual(rules.sorted_rules_hash(iter(rows)),rules.sha(rules.canonical(rows)))
+
+    def test_check_preserves_types_and_duplicate_counts(self):
+        expected={'version':3,'rules':[{'domain':['a.com'],'domain_suffix':['a.com'],'domain_regex':['^a[.]com$']}]}
+        changed=[
+            {'version':3,'rules':[{'domain':['a.com','a.com'],'domain_regex':['^a[.]com$']}]},
+            {'version':3,'rules':[{'domain':['a.com'],'domain_suffix':['a.com','a.com'],'domain_regex':['^a[.]com$']}]},
+            {'version':3,'rules':[{'domain':['a.com'],'domain_suffix':['a.com'],'domain_regex':['^b[.]com$']}]},
+        ]
+        self.assertEqual(rules.typed_values(expected),rules.typed_values(expected))
+        for value in changed:self.assertNotEqual(rules.typed_values(expected),rules.typed_values(value))
+        rows=[('domain','a.com'),('domain_regex','^a[.]com$'),('domain_suffix','a.com')]
+        self.assertEqual(list(rules.iter_dat(rules.encode_dat(rows))),rows)
+        for mutated in [rows[:-1],rows+[('domain_suffix','b.com')]]:
+            self.assertNotEqual(list(rules.iter_dat(rules.encode_dat(mutated))),rows)
+
+    def test_artifact_check_rejects_srs_and_dat_semantic_changes(self):
+        rows=[('domain','a.com'),('domain_regex','^a[.]com$'),('domain_suffix','a.com')]
+        source={'version':3,'rules':[{'domain':['a.com'],'domain_regex':['^a[.]com$'],'domain_suffix':['a.com']}]}
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);self.files(p);rules.save(p/'ru-selective.json',source)
+            def checksums():
+                (p/'SHA256SUMS').write_text(''.join(rules.sha((p/n).read_bytes())+'  '+n+'\n' for n in rules.ASSETS))
+            def decompile(args,env=None):
+                rules.save(Path(args[args.index('--output')+1]),source);return ''
+            config={'sing_box':'test','xray':'test'}
+            with patch.object(rules,'command',side_effect=decompile),patch.object(rules,'validate_xray'),patch.object(rules,'validate_regex'):
+                (p/'ru-selective.dat').write_bytes(rules.encode_dat(rows));checksums()
+                self.assertTrue(rules.check(p,config))
+                # Same value in the wrong type and duplicate multiplicity both fail.
+                for changed in [rows[:-1],rows+[rows[-1]]]:
+                    (p/'ru-selective.dat').write_bytes(rules.encode_dat(changed,ordered=True));checksums()
+                    with self.assertRaisesRegex(rules.RuleError,'DAT semantic mismatch'):rules.check(p,config)
+                (p/'ru-selective.dat').write_bytes(rules.encode_dat(rows));checksums()
+                source['rules'][0]['domain_suffix'].append('a.com')
+                with self.assertRaisesRegex(rules.RuleError,'SRS semantic mismatch'):rules.check(p,config)
+
     def test_resume_ambiguous_create_and_upload(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d);self.files(p)
@@ -55,7 +94,7 @@ class RulesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d);self.files(p)
             api=FakeGitHub();api.ambiguous=False;api.corrupt=True
-            with self.assertRaises(rules.RuleError): rules.release(api,p,p/'state.json','tag','hash')
+            with self.assertRaisesRegex(rules.RuleError,'remote hash mismatch'): rules.release(api,p,p/'state.json','tag','hash')
             self.assertEqual(api.published,0)
 
     def test_resume_lost_upload_response(self):
@@ -73,6 +112,33 @@ class RulesTests(unittest.TestCase):
             with self.assertRaises(OSError):rules.release(api,p,p/'state.json','test-tag','hash')
             rules.release(api,p,p/'state.json','test-tag','hash')
             self.assertEqual(api.published,1);self.assertTrue(rules.read_json(p/'state.json')['published'])
+
+    def test_resume_partial_starter_upload(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);self.files(p);api=FakeGitHub();api.ambiguous=False;api.partial_upload=True
+            with self.assertRaises(OSError):rules.release(api,p,p/'state.json','test-tag','hash')
+            self.assertEqual(api.states['SHA256SUMS'],'starter')
+            rules.release(api,p,p/'state.json','test-tag','hash')
+            self.assertEqual(api.deleted,['SHA256SUMS'])
+            self.assertEqual(api.created,1);self.assertEqual(api.published,1)
+            self.assertEqual(api.assets['SHA256SUMS'],(p/'SHA256SUMS').read_bytes())
+
+    def test_published_starter_never_deleted(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);self.files(p);api=FakeGitHub();api.created=1;api.draft=False
+            api.assets={name:(p/name).read_bytes() for name in ('SHA256SUMS',)+rules.ASSETS}
+            api.states['SHA256SUMS']='starter'
+            # Even matching bytes cannot authorize modifying a published release.
+            rules.save(p/'state.json',{'tag':'test-tag','semantic_hash':'hash','release_id':1})
+            with self.assertRaises(rules.RuleError):rules.release(api,p,p/'state.json','test-tag','hash')
+            self.assertEqual(api.deleted,[]);self.assertEqual(api.published,0)
+
+    def test_uploaded_corruption_never_deleted(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);self.files(p);api=FakeGitHub();api.created=1
+            api.assets['SHA256SUMS']=b'corrupt';api.states['SHA256SUMS']='uploaded'
+            with self.assertRaises(rules.RuleError):rules.release(api,p,p/'state.json','test-tag','hash')
+            self.assertEqual(api.deleted,[]);self.assertEqual(api.published,0)
 
     def test_incomplete_bundle_never_creates_release(self):
         with tempfile.TemporaryDirectory() as d:
@@ -157,17 +223,24 @@ class RulesTests(unittest.TestCase):
 class FakeGitHub:
     def __init__(self):
         self.created=0;self.published=0;self.draft=True;self.assets={};self.ambiguous=True;self.corrupt=False
+        self.states={};self.deleted=[];self.tag='test-tag'
     def get_release(self, tag=None, release_id=None):
         if not self.created:return None
-        return {'id':1,'draft':self.draft,'tag_name':tag or 'test-tag','assets':[{'id':k,'name':k} for k in self.assets]}
+        return {'id':1,'draft':self.draft,'tag_name':self.tag,'assets':[{'id':k,'name':k,'state':self.states.get(k,'uploaded')} for k in self.assets]}
     def create_release(self,tag):
-        self.created+=1
+        self.created+=1;self.tag=tag
         if self.ambiguous:self.ambiguous=False;raise OSError('lost create response')
         return self.get_release(tag)
     def upload(self,release,name,data):
+        if getattr(self,'partial_upload',False):
+            self.partial_upload=False;self.assets[name]=b'';self.states[name]='starter'
+            raise OSError('partial upload failed')
         self.assets[name]=data
+        self.states[name]='uploaded'
         if getattr(self,'lose_upload',False):self.lose_upload=False;raise OSError('lost upload response')
         return {'id':name,'name':name}
+    def delete_asset(self,asset):
+        self.deleted.append(asset['id']);del self.assets[asset['id']];self.states.pop(asset['id'],None)
     def download(self,asset):return b'corrupt' if self.corrupt else self.assets[asset['id']]
     def publish(self,release_id):
         self.draft=False;self.published+=1

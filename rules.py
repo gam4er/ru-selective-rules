@@ -4,8 +4,11 @@ import argparse
 import base64
 import contextlib
 import datetime as dt
+import gc
 import hashlib
+import itertools
 import ipaddress
+import io
 import json
 import os
 from pathlib import Path
@@ -19,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 ASSETS = ('ru-selective.srs', 'ru-selective.dat', 'ru-selective.json', 'manifest.json', 'SOURCE-NOTICES.txt')
 MAX_AGE = 72*3600
 MAX_ASSET_BYTES = 256*1024*1024
@@ -31,7 +34,15 @@ class RuleError(Exception): pass
 
 def sha(data): return hashlib.sha256(data).hexdigest()
 def canonical(value): return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
-def semantic_hash(rules): return sha(canonical(sorted(set(map(tuple, rules)))))
+def sorted_rules_hash(rows):
+    """Hash the existing canonical array representation without a giant JSON copy."""
+    digest=hashlib.sha256();digest.update(b'[');separator=b''
+    for row in rows:
+        digest.update(separator);digest.update(canonical(row));separator=b','
+    digest.update(b']');return digest.hexdigest()
+
+
+def semantic_hash(rules): return sorted_rules_hash(sorted(set(map(tuple,rules))))
 def stamp(now=None): return dt.datetime.fromtimestamp(now or time.time(), dt.timezone.utc).isoformat()
 def read_json(path): return json.loads(Path(path).read_text('utf-8'))
 
@@ -64,7 +75,9 @@ def lock(path, shared=False):
 def parse(data, default='domain_suffix'):
     out = set(); bad = 0
     types = {'full':'domain','domain':'domain_suffix','regexp':'domain_regex','regex':'domain_regex'}
-    for raw in data.decode('utf-8-sig', errors='strict').splitlines():
+    # Decode one line at a time; splitlines() retains another complete million-
+    # element string list alongside the normalized rule set.
+    for raw in io.TextIOWrapper(io.BytesIO(data),encoding='utf-8-sig',errors='strict'):
         line = raw.strip()
         if not line or line.startswith('#'): continue
         kind = default
@@ -106,22 +119,34 @@ class Snapshots:
     def obtain(self,source,now,download=fetch,validate=None):
         path=self.path/(source['id']+'.json')
         old=read_json(path) if path.exists() else None
+        old_hash=sorted_rules_hash(old['rules']) if old else None
+        old_count=len(old['rules']) if old else None
+        # Keep the LKG on disk; retaining its million row objects while parsing
+        # replacement content doubles the next scheduled run's live heap.
+        old_time=old['accepted_at'] if old else None
+        del old;gc.collect()
         try:
             data,headers=download(source)
             rules,bad=parse(data,source.get('default','domain_suffix'))
+            source_hash=sha(data);del data
+            rules_hash=sorted_rules_hash(rules)
             if len(rules)<source.get('minimum',1): raise RuleError('source below minimum count')
             if bad>max(10,len(rules)*0.01): raise RuleError('source invalid rows exceed threshold')
-            if old and len(rules)<len(old['rules'])*0.7:
-                save(self.path/'quarantine'/(source['id']+'-'+str(int(now))+'.json'), {'count':len(rules),'sha256':sha(data),'reason':'count reduction >30%'})
+            if old_count is not None and len(rules)<old_count*0.7:
+                save(self.path/'quarantine'/(source['id']+'-'+str(int(now))+'.json'), {'count':len(rules),'sha256':source_hash,'reason':'count reduction >30%'})
                 raise RuleError('source count reduction >30%; quarantined')
             # Do not overwrite the LKG snapshot until both consumers accept new content.
-            if validate and (not old or rules!=list(map(tuple,old['rules']))):validate(rules)
-            accepted={'id':source['id'],'url':source['url'],'accepted_at':now,'retrieved_at':stamp(now),'sha256':sha(data),'rules':[list(r) for r in rules],'count':len(rules),'rejected_rows':bad,'headers':headers,'license':source.get('license','Not established; upstream terms apply'),'stale':False}
+            if validate and rules_hash!=old_hash:validate(rules)
+            # Convert in place instead of keeping both complete tuple/list copies.
+            for i,row in enumerate(rules):rules[i]=list(row)
+            accepted={'id':source['id'],'url':source['url'],'accepted_at':now,'retrieved_at':stamp(now),'sha256':source_hash,'rules':rules,'count':len(rules),'rejected_rows':bad,'headers':headers,'license':source.get('license','Not established; upstream terms apply'),'stale':False}
             save(path,accepted)
             return accepted
         except (OSError,ValueError,RuleError) as exc:
-            if old and 0<=now-old['accepted_at']<=MAX_AGE:
-                return dict(old,stale=True,fetch_error=str(exc))
+            if old_time is not None and 0<=now-old_time<=MAX_AGE:
+                # Discard a rejected replacement before reading the accepted LKG.
+                rules=None;data=None;gc.collect()
+                return dict(read_json(path),stale=True,fetch_error=str(exc))
             raise RuleError(source['id']+': no valid snapshot <=72h: '+str(exc)) from exc
 
 
@@ -134,17 +159,18 @@ def varint(n):
 def field(tag,value): return varint(tag*8+2)+varint(len(value))+value
 
 
-def encode_dat(rules):
+def encode_dat(rules, ordered=False):
     # Xray GeoSiteList.entry=1; GeoSite.country_code=1/domain=2;
     # Domain.type=1 (Regex=1, RootDomain=2, Full=3), value=2.
     body=bytearray(field(1,b'RU-SELECTIVE'))
-    for kind,value in sorted(set(map(tuple,rules))):
+    for kind,value in rules if ordered else sorted(set(map(tuple,rules))):
         domain=b'\x08'+varint({'domain':3,'domain_suffix':2,'domain_regex':1}[kind])+field(2,value.encode())
         body.extend(field(2,domain))
     return field(1,bytes(body))
 
 
-def decode_dat(blob):
+def iter_dat(blob):
+    blob=memoryview(blob)
     def vi(b,i):
         n=0;shift=0
         while True:
@@ -159,14 +185,29 @@ def decode_dat(blob):
             elif tag&7==2: size,i=vi(b,i);v=b[i:i+size];i+=size
             else: raise RuleError('unexpected DAT wire type')
             yield tag>>3,v
-    out=[]
     for _,site in fields(blob):
         for tag,domain in fields(site):
             if tag==1:
                 if domain!=b'RU-SELECTIVE':raise RuleError('wrong DAT tag')
             if tag==2:
-                d=dict(fields(domain));out.append(({1:'domain_regex',2:'domain_suffix',3:'domain'}[d[1]],d[2].decode()))
-    return sorted(out)
+                d=dict(fields(domain));yield ({1:'domain_regex',2:'domain_suffix',3:'domain'}[d[1]],bytes(d[2]).decode())
+
+
+def decode_dat(blob):return sorted(iter_dat(blob))
+
+
+def typed_values(source):
+    values={}
+    for rule in source['rules']:
+        for kind,items in rule.items():
+            if kind not in ('domain','domain_suffix','domain_regex'):raise RuleError('unexpected rule field '+kind)
+            values.setdefault(kind,[]).extend(items)
+    for items in values.values():items.sort()
+    return values
+
+
+def typed_rows(values):
+    return ((kind,value) for kind in sorted(values) for value in values[kind])
 
 
 def command(args,env=None):
@@ -180,7 +221,8 @@ def validate_rules(rules,config):
         p=Path(tmp);rule={}
         for k,v in rules:rule.setdefault(k,[]).append(v)
         save(p/'source.json',{'version':3,'rules':[rule]})
-        atomic(p/'ru-selective.dat',encode_dat(rules))
+        atomic(p/'ru-selective.dat',encode_dat(rules,ordered=True))
+        del rule;gc.collect()
         command([config['sing_box'],'rule-set','compile','--output',str(p/'source.srs'),str(p/'source.json')])
         validate_regex(p,rules,config)
         validate_xray(p,config)
@@ -208,28 +250,34 @@ def check(directory,config):
         digest,name=line.split('  ',1)
         if name not in ASSETS:raise RuleError('unexpected asset '+name)
         if sha((directory/name).read_bytes())!=digest:raise RuleError('hash mismatch: '+name)
-    source=read_json(directory/'ru-selective.json')
-    rules=sorted((k,v) for rule in source['rules'] for k,values in rule.items() for v in values)
-    if decode_dat((directory/'ru-selective.dat').read_bytes())!=rules: raise RuleError('DAT semantic mismatch')
+    expected=typed_values(read_json(directory/'ru-selective.json'))
+    sentinel=object()
+    for wanted,actual in itertools.zip_longest(typed_rows(expected),iter_dat((directory/'ru-selective.dat').read_bytes()),fillvalue=sentinel):
+        if wanted!=actual:raise RuleError('DAT semantic mismatch')
+    gc.collect()
     command([config['sing_box'],'rule-set','decompile','--output',str(directory/'decompiled.tmp.json'),str(directory/'ru-selective.srs')])
     try:
-        decoded=read_json(directory/'decompiled.tmp.json')
-        # sing-box may normalize/sort lists, so compare field values as sets.
-        decoded_rules=sorted((k,v) for rule in decoded['rules'] for k,values in rule.items() for v in values)
-        if decoded_rules!=rules:raise RuleError('SRS semantic mismatch')
+        decoded=typed_values(read_json(directory/'decompiled.tmp.json'))
+        # Compare typed sorted lists including multiplicity, not sets.
+        if decoded!=expected:raise RuleError('SRS semantic mismatch')
+        del decoded;gc.collect()
     finally: (directory/'decompiled.tmp.json').unlink(missing_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         p=Path(tmp);(p/'ru-selective.dat').write_bytes((directory/'ru-selective.dat').read_bytes())
-        validate_regex(p,rules,config)
+        validate_regex(p,typed_rows(expected),config)
         validate_xray(p,config)
     return True
 
 
 def build(config):
     state=Path(config['state']); now=time.time()
-    snapshots=[Snapshots(state/'sources').obtain(s,now,validate=lambda r:validate_rules(r,config)) for s in config['sources']]
-    rules=sorted(set((k,v) for s in snapshots for k,v in s['rules']))
-    digest=semantic_hash(rules)
+    snapshots=[];merged=set()
+    for source in config['sources']:
+        snapshot=Snapshots(state/'sources').obtain(source,now,validate=lambda r:validate_rules(r,config))
+        merged.update(map(tuple,snapshot.pop('rules')))
+        snapshots.append(snapshot);gc.collect()
+    rules=sorted(merged);del merged;gc.collect()
+    digest=sorted_rules_hash(rules)
     save(state/'last-check.json',{'checked_at':stamp(now),'semantic_hash':digest,'sources':[{k:v for k,v in s.items() if k!='rules'} for s in snapshots]})
     current=read_json(state/'candidate.json') if (state/'candidate.json').exists() else None
     if current and current['semantic_hash']==digest:
@@ -239,14 +287,16 @@ def build(config):
         p=Path(tmp);rule={}
         for k,v in rules:rule.setdefault(k,[]).append(v)
         save(p/'ru-selective.json',{'version':3,'rules':[rule]})
-        atomic(p/'ru-selective.dat',encode_dat(rules))
+        atomic(p/'ru-selective.dat',encode_dat(rules,ordered=True))
+        count=len(rules)
+        del rules,rule;gc.collect()
         command([config['sing_box'],'rule-set','compile','--output',str(p/'ru-selective.srs'),str(p/'ru-selective.json')])
         versions={'builder':VERSION,'dat_encoder':'Xray GeoSite protobuf wire v1','sing_box':command([config['sing_box'],'version']),'xray':command([config['xray'],'version'])}
         notices='Program: MIT. Data is NOT relicensed.\n'+ '\n'.join(s['id']+': '+s['url']+'\n'+s['license'] for s in config['sources'])+'\n'+(Path(__file__).parent/'THIRD-PARTY-NOTICES.txt').read_text('utf-8')
         atomic(p/'SOURCE-NOTICES.txt',notices.encode())
         # Detailed exceptions can contain local paths. Keep them in local health
         # diagnostics, never in public release metadata.
-        save(p/'manifest.json',{'schema':1,'built_at':stamp(now),'semantic_hash':digest,'count':len(rules),'compilers':versions,'sources':[{k:v for k,v in s.items() if k not in ('rules','fetch_error')} for s in snapshots]})
+        save(p/'manifest.json',{'schema':1,'built_at':stamp(now),'semantic_hash':digest,'count':count,'compilers':versions,'sources':[{k:v for k,v in s.items() if k not in ('rules','fetch_error')} for s in snapshots]})
         atomic(p/'SHA256SUMS',''.join(sha((p/name).read_bytes())+'  '+name+'\n' for name in ASSETS).encode())
         check(p,config)
         target=root/digest
@@ -297,6 +347,7 @@ class GitHub:
         raise RuleError('release pagination exhausted')
     def create_release(self,tag):return self.request('POST',self.base+'/releases',{'tag_name':tag,'name':tag,'draft':True,'prerelease':False,'body':'Domain-only selective rules. See manifest and source notices.'})
     def upload(self,release,name,data):return self.request('POST','https://uploads.github.com/repos/'+self.config['repository']+'/releases/'+str(release['id'])+'/assets?name='+urllib.parse.quote(name),data,headers={'Content-Type':'application/octet-stream'})
+    def delete_asset(self,asset):return self.request('DELETE',self.base+'/releases/assets/'+str(asset['id']))
     def download(self,asset):return self.request('GET',self.base+'/releases/assets/'+str(asset['id']),raw=True,headers={'Accept':'application/octet-stream'})
     def publish(self,release_id):return self.request('PATCH',self.base+'/releases/'+str(release_id),{'draft':False,'make_latest':'true'})
 
@@ -382,11 +433,20 @@ def release(api,directory,state_path,tag,digest,before_publish=None):
     previous['release_id']=remote['id'];save(state_path,previous)
     # Refresh from ID on every run, including after lost upload/publish responses.
     remote=api.get_release(release_id=remote['id'])
+    if not remote or remote['id']!=previous['release_id'] or remote['tag_name']!=tag:
+        raise RuleError('refreshed release identity mismatch')
     assets={a['name']:a for a in remote['assets']}
     if len(assets)!=len(remote['assets']):raise RuleError('duplicate remote asset names')
     if set(assets)-set(expected):raise RuleError('unexpected remote assets')
     for name,digest_expected in expected.items():
         asset=assets.get(name)
+        if asset and asset.get('state')=='starter':
+            # GitHub can leave an incomplete asset after a failed upload. Only
+            # this recorded draft may be repaired; completed mismatches remain
+            # quarantined, and published releases are never modified.
+            if not remote['draft']:raise RuleError('published release contains incomplete asset')
+            api.delete_asset(asset)
+            asset=None
         if not asset:
             if not remote['draft']:raise RuleError('published release missing asset')
             asset=api.upload(remote,name,bundle[name])

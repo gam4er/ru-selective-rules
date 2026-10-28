@@ -10,6 +10,11 @@ User=ru-rules-build
 Group=ru-rules
 ExecStart=/opt/ru-selective-rules/venv/bin/python /opt/ru-selective-rules/rules.py build
 UMask=0027
+Environment=GOMEMLIMIT=512MiB
+Environment=GOGC=25
+MemoryAccounting=yes
+MemoryMax=1500M
+MemoryHigh=1400M
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
