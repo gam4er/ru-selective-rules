@@ -1,0 +1,15 @@
+{
+  "state": "/var/lib/ru-selective-rules/build",
+  "publisher_state": "/var/lib/ru-selective-rules/publish",
+  "repository": "gam4er/ru-selective-rules",
+  "app_id": "REPLACE",
+  "installation_id": "REPLACE",
+  "sing_box": "/usr/local/lib/sing-box-vpn/sing-box-stable",
+  "xray": "/usr/local/bin/xray",
+  "sources": [
+    {"id":"antifilter-full", "url":"https://antifilter.download/list/domains.lst", "minimum":100000, "default":"domain_suffix", "license":"No explicit redistribution license established for this feed. Source: https://antifilter.download/ ; do not label data MIT."},
+    {"id":"refilter-domains", "url":"https://raw.githubusercontent.com/1andrevich/Re-filter-lists/main/domains_all.lst", "minimum":10000, "default":"domain_suffix", "license":"Upstream repository has MIT License, Copyright (c) 2024 Andrevich. Full notice in THIRD-PARTY-NOTICES.txt; this does not establish rights in every underlying dataset."},
+    {"id":"itdog-russia-inside", "url":"https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-raw.lst", "minimum":500, "default":"domain_suffix", "license":"No LICENSE file found in upstream repository at inspection. Source: https://github.com/itdoginfo/allow-domains ; data is not relicensed."},
+    {"id":"itdog-geoblock", "url":"https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Categories/geoblock.lst", "minimum":100, "default":"domain_suffix", "license":"No LICENSE file found in upstream repository at inspection. Practical foreign geoblocks maintained by itdoginfo. Source: https://github.com/itdoginfo/allow-domains ; data is not relicensed."}
+  ]
+}

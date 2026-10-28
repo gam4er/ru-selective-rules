@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh selective routing rules every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+Unit=ru-selective-build.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=Publish verified selective routing rules with GitHub App
+Wants=network-online.target
+After=network-online.target ru-selective-build.service
+
+[Service]
+Type=oneshot
+User=ru-rules-publish
+Group=ru-rules
+ExecStart=/opt/ru-selective-rules/venv/bin/python /opt/ru-selective-rules/rules.py publish
+LoadCredential=github-app.pem:/etc/ru-selective-rules/github-app.pem
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadOnlyPaths=/var/lib/ru-selective-rules/build
+ReadWritePaths=/var/lib/ru-selective-rules/publish
+TimeoutStartSec=30min
+

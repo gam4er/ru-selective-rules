@@ -1,0 +1,5 @@
+# The builder and DAT encoder use only Python's standard library.
+# Publisher only; JWT RS256 signing. Versions are pinned, not auto-upgraded.
+cryptography==46.0.3
+cffi==2.0.0
+pycparser==2.23
