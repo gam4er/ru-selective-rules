@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 ASSETS = ('ru-selective.srs', 'ru-selective.dat', 'ru-selective.json', 'manifest.json', 'SOURCE-NOTICES.txt')
 MAX_AGE = 72*3600
 MAX_ASSET_BYTES = 256*1024*1024
@@ -185,12 +185,16 @@ def iter_dat(blob):
             elif tag&7==2: size,i=vi(b,i);v=b[i:i+size];i+=size
             else: raise RuleError('unexpected DAT wire type')
             yield tag>>3,v
-    for _,site in fields(blob):
+    for outer,site in fields(blob):
+        if outer!=1:raise RuleError('unexpected DAT top-level field')
+        category=False
         for tag,domain in fields(site):
             if tag==1:
-                if domain!=b'RU-SELECTIVE':raise RuleError('wrong DAT tag')
+                if category or domain!=b'RU-SELECTIVE':raise RuleError('wrong DAT tag')
+                category=True
             if tag==2:
                 d=dict(fields(domain));yield ({1:'domain_regex',2:'domain_suffix',3:'domain'}[d[1]],bytes(d[2]).decode())
+        if not category:raise RuleError('missing DAT tag')
 
 
 def decode_dat(blob):return sorted(iter_dat(blob))
@@ -319,7 +323,9 @@ class GitHub:
         req=urllib.request.Request(url,data=body,method=method,headers=h)
         try:
             with urllib.request.build_opener(SafeRedirect()).open(req,timeout=120) as r:
-                b=r.read();return b if raw else json.loads(b) if b else None
+                b=r.read(MAX_ASSET_BYTES+1) if raw else r.read()
+                if raw and len(b)>MAX_ASSET_BYTES:raise RuleError('remote asset exceeds size limit')
+                return b if raw else json.loads(b) if b else None
         except urllib.error.HTTPError as e:
             if e.code==404:return None
             raise RuleError('GitHub HTTP '+str(e.code)+' '+method+' '+url.split('?')[0]) from None
@@ -350,6 +356,8 @@ class GitHub:
     def delete_asset(self,asset):return self.request('DELETE',self.base+'/releases/assets/'+str(asset['id']))
     def download(self,asset):return self.request('GET',self.base+'/releases/assets/'+str(asset['id']),raw=True,headers={'Accept':'application/octet-stream'})
     def publish(self,release_id):return self.request('PATCH',self.base+'/releases/'+str(release_id),{'draft':False,'make_latest':'true'})
+    def latest(self):return self.request('GET',self.base+'/releases/latest')
+    def make_latest(self,release_id):return self.request('PATCH',self.base+'/releases/'+str(release_id),{'make_latest':'true'})
 
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
@@ -480,12 +488,75 @@ def publish(config):
     print('published '+candidate['tag'])
 
 
+def select_release(api,tag,audit_path):
+    """Select an existing verified immutable release; never mutate its files or tag."""
+    if not re.fullmatch(r'[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}',tag):raise RuleError('invalid release tag')
+    remote=api.get_release(tag=tag)
+    if not remote or remote.get('tag_name')!=tag:raise RuleError('release not found')
+    release_id=remote.get('id')
+    if (type(release_id) is not int or release_id<=0
+        or remote.get('url','').lower()!=('https://api.github.com'+api.base+'/releases/'+str(release_id)).lower()):
+        raise RuleError('release repository identity mismatch')
+    if remote.get('draft') is not False or remote.get('prerelease') is not False or remote.get('immutable') is not True:
+        raise RuleError('selection requires a published full immutable release')
+    assets={asset['name']:asset for asset in remote['assets']}
+    expected_names={'SHA256SUMS',*ASSETS}
+    if len(assets)!=len(remote['assets']) or set(assets)!=expected_names:raise RuleError('incomplete or duplicate release inventory')
+    total=0
+    for name,asset in assets.items():
+        size=asset.get('size');limit=16384 if name=='SHA256SUMS' else MAX_ASSET_BYTES
+        if asset.get('state')!='uploaded' or type(size) is not int or not 0<size<=limit:
+            raise RuleError('incomplete or oversized release asset')
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}',asset.get('digest') or ''):raise RuleError('missing GitHub asset digest')
+        total+=size
+    if total>MAX_BUNDLE_BYTES:raise RuleError('release exceeds bundle size limit')
+    def download(name):
+        asset=assets[name];data=api.download(asset)
+        if not isinstance(data,bytes) or len(data)!=asset['size'] or 'sha256:'+sha(data)!=asset['digest']:
+            raise RuleError('remote asset digest mismatch: '+name)
+        return data
+    checksum=download('SHA256SUMS')
+    lines=checksum.decode('ascii').splitlines()
+    if any(not re.fullmatch(r'[0-9a-f]{64}  [a-zA-Z0-9.-]+',line) for line in lines):raise RuleError('invalid release checksums')
+    checks={name:digest for digest,name in (line.split('  ',1) for line in lines)}
+    if len(checks)!=len(lines) or set(checks)!=set(ASSETS):raise RuleError('invalid checksum inventory')
+    retained={}
+    for name in ASSETS:
+        data=download(name)
+        if sha(data)!=checks[name]:raise RuleError('release checksum mismatch: '+name)
+        if name in ('manifest.json','ru-selective.dat'):retained[name]=data
+    manifest=json.loads(retained['manifest.json']);digest=manifest.get('semantic_hash')
+    if (manifest.get('schema')!=1 or not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest)
+        or tag.rsplit('-',1)[1]!=digest[:16] or type(manifest.get('count')) is not int or manifest['count']<1):
+        raise RuleError('release manifest identity mismatch')
+    count=0
+    def rows():
+        nonlocal count
+        previous=None
+        for row in iter_dat(retained['ru-selective.dat']):
+            if previous is not None and row<=previous:raise RuleError('DAT rules not normalized')
+            previous=row;count+=1;yield row
+    try:actual=sorted_rules_hash(rows())
+    except (IndexError,KeyError,UnicodeDecodeError,ValueError):raise RuleError('invalid release DAT') from None
+    if actual!=digest or count!=manifest['count']:raise RuleError('release DAT semantic mismatch')
+    previous=api.latest()
+    if not previous or previous.get('id')!=release_id:api.make_latest(release_id)
+    latest=api.latest()
+    if not latest or latest.get('id')!=release_id or latest.get('tag_name')!=tag:raise RuleError('GitHub latest selection not confirmed')
+    audit={'tag':tag,'release_id':release_id,'semantic_hash':digest,'selected_at':stamp(),
+           'previous_release_id':previous.get('id') if previous else None}
+    save(audit_path,audit)
+    print('selected latest '+tag)
+    return audit
+
+
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--config',default='/etc/ru-selective-rules/config.json');parser.add_argument('command',choices=['build','check','publish','status']);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--config',default='/etc/ru-selective-rules/config.json');parser.add_argument('command',choices=['build','check','publish','select-release','status']);parser.add_argument('--tag');args=parser.parse_args()
+    if (args.command=='select-release')!=bool(args.tag):parser.error('--tag is required only for select-release')
     config=read_json(args.config)
     if args.command=='status':
-        print(json.dumps({name:read_json(Path(root)/name) if (Path(root)/name).exists() else None for root,name in [(config['state'],'last-check.json'),(config['state'],'candidate.json'),(config['publisher_state'],'published.json')]},ensure_ascii=False,indent=2));return
-    lockroot=Path(config['publisher_state'] if args.command=='publish' else config['state'])
+        print(json.dumps({name:read_json(Path(root)/name) if (Path(root)/name).exists() else None for root,name in [(config['state'],'last-check.json'),(config['state'],'candidate.json'),(config['publisher_state'],'published.json'),(config['publisher_state'],'selected-release.json')]},ensure_ascii=False,indent=2));return
+    lockroot=Path(config['publisher_state'] if args.command in ('publish','select-release') else config['state'])
     with lock(lockroot/'.lock'):
         if args.command=='build':
             # Remove health marker first: failure must prevent publication of a pending candidate.
@@ -493,6 +564,9 @@ def main():
             build(config)
         elif args.command=='publish':
             with lock(Path(config['state'])/'.lock',shared=True):publish(config)
+        elif args.command=='select-release':
+            if os.name!='posix':raise RuleError('credentialed release selection requires Linux')
+            select_release(GitHub(config),args.tag,Path(config['publisher_state'])/'selected-release.json')
         else:check(read_json(Path(config['state'])/'candidate.json')['path'],config);print('verified')
 
 
